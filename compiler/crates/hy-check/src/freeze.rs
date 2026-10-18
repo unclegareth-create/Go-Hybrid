@@ -40,7 +40,7 @@ pub(crate) fn resolve_alias(st: &FnState, name: &str) -> String {
 
 /// Transitive connected component of `seed` across both `aliases` (parent and
 /// child directions) and `may_share`, including `seed` itself.
-fn storage_component(st: &FnState, seed: &str) -> HashSet<String> {
+pub(crate) fn storage_component(st: &FnState, seed: &str) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut stack = vec![seed.to_string()];
     while let Some(cur) = stack.pop() {
@@ -277,7 +277,7 @@ impl<'a> Checker<'a> {
     /// binding, and the original when an alias is the one moved — they
     /// denote the same reference-typed value).
     pub(crate) fn mark_move(
-        &self,
+        &mut self,
         st: &mut FnState,
         name: &str,
         span: hy_diag::Span,
@@ -290,6 +290,36 @@ impl<'a> Checker<'a> {
         // pointer borrow embedded in a composite literal (`p := &h; xs := []*holder{p}`).
         let mut members: Vec<String> = storage_component(st, name).into_iter().collect();
         members.sort();
+        if kind == MoveKind::Moved {
+            if let Some(idx) = st.current_idx {
+                let conflict = st.loans.iter().find(|l| {
+                    matches!(&l.target, crate::model::LoanTarget::Handle { handle } if members.contains(handle))
+                        && l.desc.contains("(live across the whole loop)")
+                        && l.created < idx
+                        && idx <= l.last
+                }).cloned();
+                if let Some(loan) = conflict {
+                    let msg = format!(
+                        "cannot move `{}` ({}) while borrowed by {}",
+                        name, desc, loan.desc
+                    );
+                    let notes = vec![
+                        format!(
+                            "the borrow-mode loan on `{}` was created at {} ({}:{}) and is live across the whole loop body (O7)",
+                            name, loan.desc, self.path, loan.span.start
+                        ),
+                        format!(
+                            "move `{}` after the loop ends, or drop the loop-header borrow",
+                            name
+                        ),
+                    ];
+                    self.diags.push(
+                        Diagnostic::error("HYB-E3101", self.path.clone(), span, msg)
+                            .with_notes(notes),
+                    );
+                }
+            }
+        }
         let mut origins = Vec::new();
         for m in &members {
             let o = self.non_owned_origin_of(st, m).map(|(orig, via_share)| {
@@ -386,8 +416,10 @@ impl<'a> Checker<'a> {
                     crate::model::TypeShape::OwnHandle(_)
                 )
             {
-                if let Some(root) = op.root_ident() {
+                if let Some(root) = crate::model::field_chain_root_ident(op) {
                     self.mark_move(st, root, mspan, desc.clone(), MoveKind::Moved);
+                } else {
+                    self.check_o54_non_ident_move(st, op, mspan);
                 }
             } else {
                 self.check_o54_non_ident_move(st, op, mspan);
@@ -407,7 +439,7 @@ impl<'a> Checker<'a> {
         for (op, _) in ops {
             let root = match op {
                 Expr::Ident { name, .. } => Some(name.as_str()),
-                Expr::Field { .. } => op.root_ident(),
+                Expr::Field { .. } => crate::model::field_chain_root_ident(op),
                 _ => None,
             };
             if let Some(src) = root {
@@ -434,6 +466,7 @@ impl<'a> Checker<'a> {
         let shape = self.shape_of_expr(st, operand);
         if matches!(operand, Expr::Field { .. })
             && matches!(shape, crate::model::TypeShape::OwnHandle(_))
+            && crate::model::field_chain_root_ident(operand).is_some()
         {
             return;
         }

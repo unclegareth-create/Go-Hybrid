@@ -197,6 +197,7 @@ impl<'a> Checker<'a> {
                                     .map(|b| (b.shape.is_handle() || arg_is_handle) && b.moved.is_none())
                                     .unwrap_or(false);
                                 if active_handle {
+                                    self.check_a2_conflict(st, cr, root, idx);
                                     let rspan = root_ident_span(&a.value).unwrap_or(a.span);
                                     self.mark_move(
                                         st,
@@ -258,6 +259,7 @@ impl<'a> Checker<'a> {
                         self.check_a2_conflict(st, cr, &root, idx);
                     }
                     CallMode::Consume => {
+                        self.check_a2_conflict(st, cr, &root, idx);
                         // A7: own-transfer INTO the API — receiver moved-from
                         self.mark_move(
                             st,
@@ -1179,16 +1181,22 @@ impl<'a> Checker<'a> {
                     &format!("receive into `{}`", l.names[0]),
                 );
             }
+            self.check_composite_nils(st, &l.values[0]);
             let shapes = self.multi_value_shapes(st, &l.values[0], l.names.len());
             let tys = self.multi_value_tys(st, &l.values[0], l.names.len());
+            let moved_non_owned = self.moved_non_owned_origin_in_expr(st, &l.values[0]);
             struct MultiDefInfo {
                 name: String,
                 shape: TypeShape,
                 ty: Option<hy_syntax::TypeExpr>,
+                is_immutable: bool,
                 reads_self: bool,
                 shadowed_origin: Option<String>,
                 prior_alias: Option<String>,
+                prior_children: Vec<String>,
                 prior_shares: Vec<String>,
+                prior_shadow_links: HashSet<(String, usize)>,
+                outer_depth: Option<usize>,
             }
             let resolved: Vec<MultiDefInfo> = l
                 .names
@@ -1201,6 +1209,17 @@ impl<'a> Checker<'a> {
                         (_, s) => (s, ty.or_else(|| l.ty.clone())),
                     };
                     let reads_self = self.value_reads_storage_of(st, &l.values[0], name);
+                    let shadowed_const = self.shape_may_share(&shape)
+                        && reads_self
+                        && self
+                            .const_write_root(
+                                st,
+                                &Place {
+                                    kind: PlaceKind::Ident(name.clone()),
+                                    span: l.values[0].span(),
+                                },
+                            )
+                            .is_some();
                     let shadowed_origin = if self.shape_may_share(&shape) && reads_self {
                         self.non_owned_origin_of(st, name).map(|(o, via_share)| {
                             if via_share && !o.starts_with("a may-share peer of ") {
@@ -1227,6 +1246,20 @@ impl<'a> Checker<'a> {
                     } else {
                         None
                     };
+                    let prior_children: Vec<String> = if reads_self {
+                        st.aliases
+                            .iter()
+                            .filter_map(|(k, v)| {
+                                if v == name && k != name {
+                                    Some(k.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     let prior_shares: Vec<String> = if reads_self {
                         st.may_share
                             .get(name)
@@ -1235,26 +1268,85 @@ impl<'a> Checker<'a> {
                     } else {
                         Vec::new()
                     };
+                    let prior_shadow_links = if reads_self {
+                        st.shadow_links.get(name).cloned().unwrap_or_default()
+                    } else {
+                        HashSet::new()
+                    };
+                    let outer_depth = if st
+                        .scopes
+                        .last()
+                        .is_some_and(|top| !top.contains_key(name))
+                    {
+                        st.lookup_depth(name)
+                    } else {
+                        None
+                    };
                     MultiDefInfo {
                         name: name.clone(),
                         shape,
                         ty,
+                        is_immutable: immutable || shadowed_const,
                         reads_self,
                         shadowed_origin,
                         prior_alias,
+                        prior_children,
                         prior_shares,
+                        prior_shadow_links,
+                        outer_depth,
                     }
                 })
                 .collect();
+            self.mark_move_in_value(
+                st,
+                &l.values[0],
+                format!("the move-define `{}`", l.values[0].render()),
+            );
             for info in resolved {
                 let is_view = matches!(info.shape, TypeShape::BorrowHandle(_));
-                self.define_binding(st, &info.name, info.shape.clone(), info.ty, immutable, managed);
+                let may_share = self.shape_may_share(&info.shape)
+                    || matches!(info.shape, TypeShape::Unknown);
+                self.define_binding(
+                    st,
+                    &info.name,
+                    info.shape.clone(),
+                    info.ty,
+                    info.is_immutable,
+                    managed,
+                );
+                self.clone_moved_handle_loans(st, &l.values[0], &info.name);
+                if may_share {
+                    if let Some(origin) = &moved_non_owned {
+                        if let Some(b) = st.env_lookup_mut(&info.name) {
+                            if b.non_owned_origin.is_none() {
+                                b.non_owned_origin = Some(origin.clone());
+                            }
+                        }
+                    }
+                }
                 if is_view {
                     self.extend_call_loans_to_view(st, &l.values[0], &info.name, idx);
                 }
                 if info.reads_self {
+                    if !info.prior_shadow_links.is_empty() {
+                        st.shadow_links
+                            .entry(info.name.clone())
+                            .or_default()
+                            .extend(info.prior_shadow_links);
+                    }
+                    if let Some(depth) = info.outer_depth {
+                        st.shadow_links
+                            .entry(info.name.clone())
+                            .or_default()
+                            .insert((info.name.clone(), depth));
+                    }
                     if let Some(pa) = info.prior_alias {
                         st.aliases.insert(info.name.clone(), pa);
+                    }
+                    for child in info.prior_children {
+                        if child != info.name {
+                            st.aliases.insert(child, info.name.clone());
+                        }
                     }
                     for peer in info.prior_shares {
                         st.share_edge(&info.name, &peer);
@@ -1353,6 +1445,7 @@ impl<'a> Checker<'a> {
                     || matches!(unwrap_parens(value), Expr::Move { .. })
                 {
                     self.define_binding(st, name, shape, ty, immutable, managed);
+                    self.clone_moved_handle_loans(st, value, name);
                     if let Some(origin) = moved_non_owned {
                         if let Some(b) = st.env_lookup_mut(name) {
                             b.non_owned_origin = Some(origin);
@@ -1425,6 +1518,7 @@ impl<'a> Checker<'a> {
                     None
                 };
                 self.define_binding(st, name, shape, ty, immutable, managed);
+                self.clone_moved_handle_loans(st, value, name);
                 if let Some(origin) = &moved_non_owned {
                     if let Some(b) = st.env_lookup_mut(name) {
                         if b.non_owned_origin.is_none() {
@@ -1496,6 +1590,61 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// When a handle (or composite carrying a handle) is moved into `dst_name`
+    /// (`doc2 := move doc`, `doc2 = move doc`, `h2 := holder{d: move doc}`),
+    /// any active `LoanTarget::Handle` loans on the moved source handle must
+    /// also apply to `dst_name` so mutating/consuming `dst_name` while a prior
+    /// borrow view (`v := doc.array()`) is still live triggers HYB-E3101 (A2).
+    pub(crate) fn clone_moved_handle_loans(&self, st: &mut FnState, value: &Expr, dst_name: &str) {
+        if dst_name == "_" {
+            return;
+        }
+        let dst_carries_handle = self
+            .lookup_binding(st, dst_name)
+            .map(|b| {
+                self.shape_carries_handle(&b.shape) || matches!(b.shape, TypeShape::Unknown)
+            })
+            .unwrap_or(false);
+        if !dst_carries_handle {
+            return;
+        }
+        let mut ops = Vec::new();
+        crate::model::collect_move_operands(value, &mut ops);
+        let mut src_roots = HashSet::new();
+        for (op, _) in ops {
+            let root = match op {
+                Expr::Ident { name, .. } => Some(name.as_str()),
+                Expr::Field { .. } => crate::model::field_chain_root_ident(op),
+                _ => None,
+            };
+            if let Some(r) = root {
+                for m in crate::freeze::storage_component(st, r) {
+                    src_roots.insert(m);
+                }
+            }
+        }
+        if src_roots.is_empty() {
+            return;
+        }
+        let mut cloned = Vec::new();
+        for l in &st.loans {
+            if let LoanTarget::Handle { handle } = &l.target {
+                if src_roots.contains(handle) && handle != dst_name {
+                    cloned.push(Loan {
+                        target: LoanTarget::Handle {
+                            handle: dst_name.to_string(),
+                        },
+                        created: l.created,
+                        last: l.last,
+                        span: l.span,
+                        desc: l.desc.clone(),
+                    });
+                }
+            }
+        }
+        st.loans.extend(cloned);
+    }
+
     /// Does `value` hand back (part of) the storage of the binding `name`,
     /// in one of the forms `record_may_share` / `record_alias` link: a bare
     /// or parenthesized copy, a re-slice, a reference-bearing projection, a
@@ -1533,7 +1682,13 @@ impl<'a> Checker<'a> {
                 .any(|it| self.value_reads_storage_of(st, it, name)),
             Expr::Call { callee, args, .. } => {
                 let result = self.shape_of_expr(st, unwrap_parens(value));
-                if !(self.shape_may_share(&result) || matches!(result, TypeShape::Unknown)) {
+                let any_result_may_share = self.shape_may_share(&result)
+                    || matches!(result, TypeShape::Unknown)
+                    || self
+                        .multi_value_shapes(st, value, 8)
+                        .iter()
+                        .any(|sh| self.shape_may_share(sh) || matches!(sh, TypeShape::Unknown));
+                if !any_result_may_share {
                     return false;
                 }
                 let via_arg = args.iter().any(|a| {
@@ -3505,6 +3660,13 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        if let Some(origin) = self.moved_non_owned_origin_in_expr(st, value) {
+            if let Some(nb) = st.env_lookup_mut(name) {
+                if nb.non_owned_origin.is_none() {
+                    nb.non_owned_origin = Some(origin);
+                }
+            }
+        }
     }
 
     /// The results of ONE call can alias each other: `return m, m` hands the
@@ -4735,6 +4897,13 @@ impl<'a> Checker<'a> {
             }
         }
 
+        // N1 for composite literals: a rebind whose RHS is a literal (or a
+        // call with a literal argument, including multi-value `a, b = f(job{m: nil})`)
+        // with nested nils carries its own type context (HYB-E4001).
+        for v in values {
+            self.check_composite_nils(st, v);
+        }
+
         // N1: `x = nil` / `s.f = nil` / `m[k] = nil` against a known
         // non-nilable target is a compile error (HYB-E4001). An unresolvable
         // target stays silent here — no boundary is involved; N1 fires only
@@ -4756,10 +4925,6 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            // N1 for composite literals: a rebind whose RHS is a literal
-            // with nested nils (`j = jobT{m: nil}`) carries its own type
-            // context (HYB-E4001).
-            self.check_composite_nils(st, v);
             // Constant overflow on assignment: `n = 300`, `arr[0] = 300`, `n += 300`
             if !matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
                 if let Some(target_ty) = self.place_target_ty(st, t) {
@@ -4925,6 +5090,7 @@ impl<'a> Checker<'a> {
                         b.moved = None; // a fresh value re-owns the binding
                         b.non_owned_origin = info.non_owned;
                     }
+                    self.clone_moved_handle_loans(st, v, name);
                     // a rebind re-owns the binding: drop the old alias and
                     // may-share edges, then re-record from the new value (#27)
                     st.aliases.remove(name);
@@ -4972,6 +5138,7 @@ impl<'a> Checker<'a> {
         } else if values.len() == 1 && targets.len() > 1 {
             let shapes = self.multi_value_shapes(st, &values[0], targets.len());
             let tys = self.multi_value_tys(st, &values[0], targets.len());
+            let moved_non_owned = self.moved_non_owned_origin_in_expr(st, &values[0]);
             let mut ref_roots = Vec::new();
             collect_ref_roots(&values[0], &mut ref_roots);
             self.collect_callee_const_return_roots(st, &values[0], &mut ref_roots, 0);
@@ -5038,8 +5205,13 @@ impl<'a> Checker<'a> {
                             b.ty = ty;
                         }
                         b.moved = None;
-                        b.non_owned_origin = None;
+                        b.non_owned_origin = if may_share || matches!(shape, TypeShape::Unknown) {
+                            moved_non_owned.clone()
+                        } else {
+                            None
+                        };
                     }
+                    self.clone_moved_handle_loans(st, &values[0], name);
                     st.aliases.remove(name);
                     st.share_clear(name);
                     if reads_self {
@@ -5347,11 +5519,22 @@ impl<'a> Checker<'a> {
                         .collect();
 
                     if *op == AssignOp::Assign && targets.len() == values.len() {
-                        let rhs_info: Vec<(TypeShape, Option<hy_syntax::TypeExpr>)> = values
+                        let rhs_info: Vec<(TypeShape, Option<hy_syntax::TypeExpr>, Option<String>)> = values
                             .iter()
-                            .map(|v| (self.shape_of_expr(&cst, v), self.ty_of_expr(&cst, v)))
+                            .map(|v| {
+                                let non_owned = match crate::model::unwrap_parens(v) {
+                                    Expr::Ident { name: src, .. } => self
+                                        .lookup_binding(&cst, src)
+                                        .and_then(|b| b.non_owned_origin.clone()),
+                                    other => move_operand_ident(other)
+                                        .and_then(|src| self.lookup_binding(&cst, &src))
+                                        .and_then(|b| b.non_owned_origin.clone())
+                                        .or_else(|| self.moved_non_owned_origin_in_expr(&cst, other)),
+                                };
+                                (self.shape_of_expr(&cst, v), self.ty_of_expr(&cst, v), non_owned)
+                            })
                             .collect();
-                        for (i, ((t, v), (shape, ty))) in targets
+                        for (i, ((t, v), (shape, ty, non_owned))) in targets
                             .iter()
                             .zip(values.iter())
                             .zip(rhs_info)
@@ -5374,6 +5557,7 @@ impl<'a> Checker<'a> {
                                     if ty.is_some() || b.ty.is_none() {
                                         b.ty = ty;
                                     }
+                                    b.non_owned_origin = non_owned;
                                 }
                                 cst.aliases.remove(name);
                                 cst.share_clear(name);
@@ -5394,6 +5578,7 @@ impl<'a> Checker<'a> {
                     } else if *op == AssignOp::Assign && values.len() == 1 && targets.len() > 1 {
                         let shapes = self.multi_value_shapes(&cst, &values[0], targets.len());
                         let tys = self.multi_value_tys(&cst, &values[0], targets.len());
+                        let moved_non_owned = self.moved_non_owned_origin_in_expr(&cst, &values[0]);
                         for (i, ((t, shape), ty)) in
                             targets.iter().zip(shapes).zip(tys).enumerate()
                         {
@@ -5401,6 +5586,8 @@ impl<'a> Checker<'a> {
                                 continue;
                             }
                             if let PlaceKind::Ident(name) = &t.kind {
+                                let may_share = self.shape_may_share(&shape)
+                                    || matches!(shape, TypeShape::Unknown);
                                 if let Some(b) = cst.env_lookup_mut(name) {
                                     if !matches!(shape, TypeShape::Unknown) || b.ty.is_none() {
                                         b.shape = shape.clone();
@@ -5408,6 +5595,11 @@ impl<'a> Checker<'a> {
                                     if ty.is_some() || b.ty.is_none() {
                                         b.ty = ty;
                                     }
+                                    b.non_owned_origin = if may_share {
+                                        moved_non_owned.clone()
+                                    } else {
+                                        None
+                                    };
                                 }
                                 cst.aliases.remove(name);
                                 cst.share_clear(name);
@@ -5543,6 +5735,7 @@ impl<'a> Checker<'a> {
         if l.values.len() == 1 && l.names.len() > 1 {
             let shapes = self.multi_value_shapes(st, &l.values[0], l.names.len());
             let tys = self.multi_value_tys(st, &l.values[0], l.names.len());
+            let moved_non_owned = self.moved_non_owned_origin_in_expr(st, &l.values[0]);
             let resolved: Vec<(String, TypeShape, Option<hy_syntax::TypeExpr>, bool)> = l
                 .names
                 .iter()
@@ -5570,7 +5763,17 @@ impl<'a> Checker<'a> {
                 })
                 .collect();
             for (name, shape, ty, is_imm) in resolved {
+                let may_share = self.shape_may_share(&shape) || matches!(shape, TypeShape::Unknown);
                 self.define_binding(st, &name, shape.clone(), ty, is_imm, false);
+                if may_share {
+                    if let Some(origin) = &moved_non_owned {
+                        if let Some(b) = st.env_lookup_mut(&name) {
+                            if b.non_owned_origin.is_none() {
+                                b.non_owned_origin = Some(origin.clone());
+                            }
+                        }
+                    }
+                }
                 if move_operand_ident(&l.values[0]).is_none() {
                     self.record_multi_value_share_and_alias(st, &name, &shape, &l.values[0]);
                 }
@@ -5598,7 +5801,15 @@ impl<'a> Checker<'a> {
                         },
                     )
                     .is_some();
+            let moved_non_owned = self.moved_non_owned_origin_in_expr(st, value);
             self.define_binding(st, name, shape, ty, immutable || shadowed_const, false);
+            if let Some(origin) = moved_non_owned {
+                if let Some(b) = st.env_lookup_mut(name) {
+                    if b.non_owned_origin.is_none() {
+                        b.non_owned_origin = Some(origin);
+                    }
+                }
+            }
             if move_operand_ident(value).is_none() {
                 self.record_may_share(st, name, value);
                 self.record_alias(st, name, value);
